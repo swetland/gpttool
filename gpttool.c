@@ -21,22 +21,38 @@
 #include <string.h>
 #include <fcntl.h>
 
-#include <zlib.h>
-
 #include <linux/fs.h>
-
 #include <sys/stat.h>
+#include <sys/ioctl.h>
+
+#include <zlib.h>
 
 typedef unsigned char u8;
 typedef unsigned short u16;
 typedef unsigned int u32;
 typedef unsigned long long u64;
 
+#define _crc32(ptr,len) crc32(crc32(0,Z_NULL,0),(void*)(ptr),len)
+
 const u8 partition_type_uuid[16] = {
 	0xa2, 0xa0, 0xd0, 0xeb, 0xe5, 0xb9, 0x33, 0x44,
 	0x87, 0xc0, 0x68, 0xb6, 0xb7, 0x26, 0x99, 0xc7,
 };
 
+const u8 partition_type_efi[16] = {
+	0x28, 0x73, 0x2a, 0xc1, 0x1f, 0xf8, 0xd2, 0x11,
+	0xba, 0x4b, 0x00, 0xa0, 0xc9, 0x3e, 0xc9, 0x3b,
+};
+
+const u8 partition_type_linux[16] = {
+	0xa2, 0xa0, 0xd0, 0xeb, 0xe5, 0xb9, 0x33, 0x44,
+	0x87, 0xc0, 0x68, 0xb6, 0xb7, 0x26, 0x99, 0xc7,
+};
+
+const u8 partition_type_swap[16] = {
+	0x6d, 0xfd, 0x57, 0x06, 0xab, 0xa4, 0xc4, 0x43,
+	0x84, 0xe5, 0x09, 0x33, 0xc8, 0x4b, 0x4f, 0x4f,
+};
 
 #define EFI_VERSION 0x00010000
 #define EFI_MAGIC "EFI PART"
@@ -95,12 +111,12 @@ void get_uuid(u8 *uuid)
 void init_mbr(u8 *mbr, u32 blocks)
 {
 	mbr[0x1be] = 0x00; // nonbootable
-	mbr[0x1bf] = 0xFF; // bogus CHS
-	mbr[0x1c0] = 0xFF;
-	mbr[0x1c1] = 0xFF;
+	mbr[0x1bf] = 0x00; // bogus CHS
+	mbr[0x1c0] = 0x01;
+	mbr[0x1c1] = 0x00;
 
 	mbr[0x1c2] = 0xEE; // GPT partition
-	mbr[0x1c3] = 0xFF; // bogus CHS
+	mbr[0x1c3] = 0xFE; // bogus CHS
 	mbr[0x1c4] = 0xFF;
 	mbr[0x1c5] = 0xFF;
 
@@ -115,7 +131,7 @@ void init_mbr(u8 *mbr, u32 blocks)
 	mbr[0x1ff] = 0xaa;
 }
 
-int add_ptn(struct ptable *ptbl, u64 first, u64 last, const char *name)
+int add_ptn(struct ptable *ptbl, u64 first, u64 last, const char *name, const u8 *type)
 {
 	struct efi_header *hdr = &ptbl->header;
 	struct efi_entry *entry = ptbl->entry;
@@ -133,7 +149,7 @@ int add_ptn(struct ptable *ptbl, u64 first, u64 last, const char *name)
 	for (n = 0; n < EFI_ENTRIES; n++, entry++) {
 		if (entry->type_uuid[0])
 			continue;
-		memcpy(entry->type_uuid, partition_type_uuid, 16);
+		memcpy(entry->type_uuid, type, 16);
 		get_uuid(entry->uniq_uuid);
 		entry->first_lba = first;
 		entry->last_lba = last;
@@ -152,7 +168,8 @@ int usage(void)
 		"       gpttool read <disk>\n"
 		"       gpttool test [ <partition> ]*\n"
 		"\n"
-		"partition:  [<name>]:<size>[kmg] | @<file-of-partitions>\n"
+		"partition:  [<name>]:<size>[kmg][=linux|=swap|=efi]\n"
+		"       or:  @<file-of-partitions>\n"
 		);
 	return 0;
 }
@@ -217,7 +234,9 @@ u64 parse_size(char *sz)
 
 int parse_ptn(struct ptable *ptbl, char *x)
 {
+	const u8 *type = partition_type_uuid; 
 	char *y = strchr(x, ':');
+	char *z;
 	u64 sz;
 
 	if (!y) {
@@ -226,6 +245,17 @@ int parse_ptn(struct ptable *ptbl, char *x)
 	}
 	*y++ = 0;
 
+	z = strchr(y, '=');
+	if (z) {
+		*z++ = 0;
+		if (!strcmp(z, "efi")) {
+			type = partition_type_efi;
+		} else if (!strcmp(z, "linux")) {
+			type = partition_type_linux;
+		} else if (!strcmp(z, "swap")) {
+			type = partition_type_swap;
+		}
+	}
 	if (*y == 0) {
 		sz = ptbl->header.last_lba - next_lba;
 	} else {
@@ -242,22 +272,32 @@ int parse_ptn(struct ptable *ptbl, char *x)
 		return -1;
 	}
 
-	if (x[0] && add_ptn(ptbl, next_lba, next_lba + sz - 1, x))
+	if (x[0] && add_ptn(ptbl, next_lba, next_lba + sz - 1, x, type))
 		return -1;
 
 	next_lba = next_lba + sz;
 	return 0;
 }
 
+void update_crc32(struct ptable *ptbl) {
+	u32 n;
+
+
+	n = _crc32((void*) ptbl->entry, sizeof(ptbl->entry));
+	ptbl->header.entries_crc32 = n;
+
+	ptbl->header.crc32 = 0;
+	n = _crc32((void*) &ptbl->header, sizeof(ptbl->header));
+	ptbl->header.crc32 = n;
+}
+
 int main(int argc, char **argv)
 {
 	struct ptable ptbl;
-	struct efi_entry *entry;
 	struct efi_header *hdr = &ptbl.header;
 	struct stat s;
-	u32 n;
-	u64 sz, blk;
-	int fd;
+	u64 sz;
+	int fd = -1;
 	const char *device;
 	int real_disk = 0;
 
@@ -282,18 +322,29 @@ int main(int argc, char **argv)
 	}
 
 	if (real_disk) {
+#if 0
 		if (!strcmp(device, "/dev/sda") || 
 		    !strcmp(device, "/dev/sdb")) {
 			fprintf(stderr,"error: refusing to partition sda or sdb\n");
 			return -1;
 		}
-		
+#endif		
 		fd = open(device, O_RDWR);
 		if (fd < 0) {
 			fprintf(stderr,"error: cannot open '%s'\n", device);
 			return -1;
 		}
-		if (ioctl(fd, BLKGETSIZE64, &sz)) {
+		if (fstat(fd, &s)) {
+			fprintf(stderr,"error: cannot stat '%s'\n", device);
+			return -1;
+		}
+		if (!S_ISBLK(s.st_mode) && !S_ISCHR(s.st_mode)) {
+			sz = s.st_size;
+			if (sz & 511) {
+				fprintf(stderr,"error: file size not multiple of 512\n");
+				return -1;
+			}
+		} else if (ioctl(fd, BLKGETSIZE64, &sz)) {
 			fprintf(stderr,"error: cannot query block device size\n");
 			return -1;
 		}
@@ -311,7 +362,7 @@ int main(int argc, char **argv)
 	hdr->header_lba = 1;
 	hdr->backup_lba = sz - 1;
 	hdr->first_lba = 34;
-	hdr->last_lba = sz - 1;
+	hdr->last_lba = sz - 33;
 	get_uuid(hdr->volume_uuid);
 	hdr->entries_lba = 2;
 	hdr->entries_count = 128;
@@ -353,24 +404,43 @@ int main(int argc, char **argv)
 		argv++;
 	}
 
-	n = crc32(0, Z_NULL, 0);
-	n = crc32(n, (void*) ptbl.entry, sizeof(ptbl.entry));
-	hdr->entries_crc32 = n;
-
-	n = crc32(0, Z_NULL, 0);
-	n = crc32(n, (void*) &ptbl.header, sizeof(ptbl.header));
-	hdr->crc32 = n;
+	update_crc32(&ptbl);
 
 	show(&ptbl);
 
 	if (real_disk) {
-  		write(fd, &ptbl, sizeof(ptbl));
+		u64 off = (sz - 33) * 512;
+  		if (write(fd, &ptbl, sizeof(ptbl)) != sizeof(ptbl)) {
+			fprintf(stderr,"error writing primary partition table\n");
+			return -1;
+		}
+		if (lseek(fd, off, SEEK_SET) != off) {
+			fprintf(stderr,"error seeking to secondary partition table\n");
+			return -1;
+		}
+
+		/* reverse these for the secondary copy */
+		hdr->header_lba = sz -1;
+		hdr->backup_lba = 1;
+		update_crc32(&ptbl);
+
+		if (write(fd, &ptbl.entry, sizeof(ptbl) - 1024) != (sizeof(ptbl) - 1024)) {
+			fprintf(stderr,"error writing secondary partition table\n");
+			return -1;
+		}
+		if (write(fd, &ptbl.header, 512) != 512) {
+			fprintf(stderr,"error writing secondary partition header\n");
+			return -1;
+		}
 		fsync(fd);
 
 		if (ioctl(fd, BLKRRPART, 0)) {
-			fprintf(stderr,"could not re-read partition table\n");
+			fprintf(stderr,"warning: could not re-read partition table\n");
 		}
-		close(fd);
+		if (close(fd)) {
+			fprintf(stderr,"error writing data\n");
+			return -1;
+		}
 	}
 	return 0;
 }
